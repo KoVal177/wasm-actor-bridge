@@ -1,7 +1,7 @@
 //! Core message types.
 
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 
 /// Trait bound for types that can cross the Worker boundary.
 ///

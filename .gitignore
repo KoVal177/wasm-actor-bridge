@@ -1,2 +1,8 @@
 .llm_instructions/
 /target/
+*.pdb
+.DS_Store
+.idea/
+.vscode/
+# Library crate — Cargo.lock is intentionally excluded per Cargo convention
+Cargo.lock

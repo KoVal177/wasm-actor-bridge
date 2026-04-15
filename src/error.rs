@@ -15,9 +15,15 @@ pub enum BridgeError {
     #[error("postMessage failed: {0}")]
     PostMessage(String),
 
-    /// Worker fired an `error` or `messageerror` event.
-    #[error("worker error: {0}")]
+    /// Script-level error (wrong URL, CSP, syntax error in worker script).
+    /// Not automatically recoverable — the script itself is broken.
+    #[error("worker script error: {0}")]
     WorkerError(String),
+
+    /// Worker process crashed (WASM panic, OOM, unreachable trap).
+    /// A Supervisor should attempt respawn.
+    #[error("worker crashed")]
+    WorkerCrashed,
 
     /// The worker handle has been terminated.
     #[error("bridge terminated")]
@@ -26,4 +32,28 @@ pub enum BridgeError {
     /// The event channel has been closed (receiver dropped).
     #[error("event channel closed")]
     ChannelClosed,
+
+    /// The command channel is full — the worker cannot accept more commands.
+    #[error("command channel full")]
+    ChannelFull,
+
+    /// Builder configuration is invalid.
+    #[error("invalid configuration: {0}")]
+    InvalidConfig(String),
+}
+
+impl BridgeError {
+    /// True if the error indicates the worker process died unexpectedly
+    /// and respawn may succeed.
+    pub fn is_crash(&self) -> bool {
+        matches!(self, Self::WorkerCrashed)
+    }
+
+    /// True if the error is permanent and respawn will not help.
+    pub fn is_permanent(&self) -> bool {
+        matches!(
+            self,
+            Self::Spawn(_) | Self::WorkerError(_) | Self::InvalidConfig(_)
+        )
+    }
 }

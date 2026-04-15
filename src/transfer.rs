@@ -11,8 +11,8 @@
 #[cfg(target_arch = "wasm32")]
 mod wasm_impl {
     use js_sys::{Array, Uint8Array};
-    use serde::de::DeserializeOwned;
     use serde::Serialize;
+    use serde::de::DeserializeOwned;
     use wasm_bindgen::JsCast;
     use web_sys::DedicatedWorkerGlobalScope;
 
@@ -26,9 +26,7 @@ mod wasm_impl {
     }
 
     /// Unpack a `MessageEvent` into raw wire components (no deserialization).
-    pub(crate) fn unpack_wire(
-        event: &web_sys::MessageEvent,
-    ) -> Result<WireMessage, BridgeError> {
+    pub(crate) fn unpack_wire(event: &web_sys::MessageEvent) -> Result<WireMessage, BridgeError> {
         let data: Array = event
             .data()
             .dyn_into()
@@ -37,18 +35,14 @@ mod wasm_impl {
         // Slot 0: correlation ID.
         let corr_js = data.get(0);
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let correlation_id = if corr_js.is_null() || corr_js.is_undefined() {
-            None
-        } else {
-            Some(
-                corr_js
-                    .as_f64()
-                    .ok_or_else(|| {
-                        BridgeError::Serialisation("correlation_id not a number".into())
-                    })?
-                    as u64,
-            )
-        };
+        let correlation_id =
+            if corr_js.is_null() || corr_js.is_undefined() {
+                None
+            } else {
+                Some(corr_js.as_f64().ok_or_else(|| {
+                    BridgeError::Serialisation("correlation_id not a number".into())
+                })? as u64)
+            };
 
         // Slot 1: typed message (raw JsValue — caller deserializes).
         let payload = data.get(1);
@@ -110,8 +104,7 @@ mod wasm_impl {
                 .map_err(|e| BridgeError::PostMessage(format!("{e:?}")))?;
         } else {
             msg.push(&wasm_bindgen::JsValue::NULL);
-            post_fn(&msg, None)
-                .map_err(|e| BridgeError::PostMessage(format!("{e:?}")))?;
+            post_fn(&msg, None).map_err(|e| BridgeError::PostMessage(format!("{e:?}")))?;
         }
 
         Ok(())
@@ -128,10 +121,15 @@ mod wasm_impl {
 
         let scope: DedicatedWorkerGlobalScope = js_sys::global().unchecked_into();
 
-        build_and_post(correlation_id, &js_msg, bytes, |msg, transfer| match transfer {
-            Some(t) => scope.post_message_with_transfer(msg, t),
-            None => scope.post_message(msg),
-        })
+        build_and_post(
+            correlation_id,
+            &js_msg,
+            bytes,
+            |msg, transfer| match transfer {
+                Some(t) => scope.post_message_with_transfer(msg, t),
+                None => scope.post_message(msg),
+            },
+        )
     }
 
     /// Post a typed message + optional binary payload from Main → Worker.
@@ -144,10 +142,35 @@ mod wasm_impl {
         let js_msg = serde_wasm_bindgen::to_value(message)
             .map_err(|e| BridgeError::Serialisation(e.to_string()))?;
 
-        build_and_post(correlation_id, &js_msg, bytes, |msg, transfer| match transfer {
-            Some(t) => worker.post_message_with_transfer(msg, t),
-            None => worker.post_message(msg),
-        })
+        build_and_post(
+            correlation_id,
+            &js_msg,
+            bytes,
+            |msg, transfer| match transfer {
+                Some(t) => worker.post_message_with_transfer(msg, t),
+                None => worker.post_message(msg),
+            },
+        )
+    }
+
+    /// Post a raw `JsValue` payload from Main → Worker without serialization.
+    ///
+    /// Used for cancel messages where the payload is `JsValue::NULL`.
+    pub(crate) fn post_to_worker_raw(
+        worker: &web_sys::Worker,
+        correlation_id: Option<u64>,
+        js_msg: &wasm_bindgen::JsValue,
+        bytes: Option<&[u8]>,
+    ) -> Result<(), BridgeError> {
+        build_and_post(
+            correlation_id,
+            js_msg,
+            bytes,
+            |msg, transfer| match transfer {
+                Some(t) => worker.post_message_with_transfer(msg, t),
+                None => worker.post_message(msg),
+            },
+        )
     }
 }
 
