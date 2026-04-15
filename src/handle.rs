@@ -7,8 +7,8 @@ mod wasm_impl {
     use std::marker::PhantomData;
     use std::pin::Pin;
     use std::rc::Rc;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::task::{Context, Poll};
 
     use serde::de::DeserializeOwned;
@@ -70,10 +70,20 @@ mod wasm_impl {
     ///
     /// When the last clone is dropped, the Worker is terminated and the
     /// associated [`EventStream`](crate::EventStream) yields `None`.
-    #[derive(Clone)]
     pub struct WorkerHandle<Cmd: ActorMessage, Evt: ActorMessage> {
         pub(crate) inner: Arc<BridgeInner>,
         _phantom: PhantomData<fn(Cmd, Evt)>,
+    }
+
+    // Manual Clone: derived Clone would require Cmd: Clone + Evt: Clone
+    // but we only clone Arc + PhantomData, neither of which need it.
+    impl<Cmd: ActorMessage, Evt: ActorMessage> Clone for WorkerHandle<Cmd, Evt> {
+        fn clone(&self) -> Self {
+            Self {
+                inner: Arc::clone(&self.inner),
+                _phantom: PhantomData,
+            }
+        }
     }
 
     #[allow(clippy::needless_pass_by_value)] // Taking ownership of Cmd/bytes is the intended API.
@@ -83,6 +93,18 @@ mod wasm_impl {
                 inner,
                 _phantom: PhantomData,
             }
+        }
+
+        /// Send the one-time init payload to the worker.
+        ///
+        /// Must be called exactly once, immediately after `spawn_worker`,
+        /// before any `send` or `call`. Sending a second init is a logic error
+        /// — it will be deserialized as a `Cmd` and likely fail.
+        pub fn send_init<Init: serde::Serialize>(&self, init: &Init) -> Result<(), BridgeError> {
+            if self.inner.terminated.load(Ordering::Acquire) {
+                return Err(BridgeError::Terminated);
+            }
+            crate::transfer::post_to_worker(&self.inner.worker, None, init, None)
         }
 
         /// Post a command (fire-and-forget, no binary sidecar).
@@ -103,12 +125,13 @@ mod wasm_impl {
 
         /// Send a command and await the response (RPC).
         ///
-        /// The worker's first `ctx.reply()` for this command is routed
-        /// back as the return value. Subsequent replies (if any) go to
-        /// the [`EventStream`](crate::EventStream).
-        pub fn call(&self, cmd: Cmd) -> CallFuture<Evt> {
+        /// Returns a [`CallHandle`] that:
+        /// - Resolves to the worker's first `ctx.respond()` for this request.
+        /// - Sends a cancellation message to the worker if dropped before
+        ///   resolving — the worker's `CancellationToken` fires.
+        pub fn call(&self, cmd: Cmd) -> CallHandle<Evt> {
             if self.inner.terminated.load(Ordering::Acquire) {
-                return CallFuture::ready(Err(BridgeError::Terminated));
+                return CallHandle::ready(Err(BridgeError::Terminated));
             }
 
             let id = self.inner.counter.fetch_add(1, Ordering::Relaxed);
@@ -119,10 +142,10 @@ mod wasm_impl {
                 crate::transfer::post_to_worker(&self.inner.worker, Some(id), &cmd, None)
             {
                 self.inner.pending.borrow_mut().remove(&id);
-                return CallFuture::ready(Err(e));
+                return CallHandle::ready(Err(e));
             }
 
-            CallFuture::pending(rx)
+            CallHandle::pending(rx, id, Arc::clone(&self.inner))
         }
 
         /// Terminate the Worker.
@@ -146,13 +169,21 @@ mod wasm_impl {
         }
     }
 
-    // ── CallFuture ───────────────────────────────────────────
+    // ── CallHandle ───────────────────────────────────────────
 
     /// Future returned by [`WorkerHandle::call`].
     ///
-    /// Resolves to the worker's first reply for the correlated request.
-    pub struct CallFuture<Evt> {
+    /// Resolves to the worker's first response for the correlated request.
+    /// **Cancels on drop**: if dropped before resolving, sends a cancellation
+    /// message to the worker, firing the handler's `CancellationToken`.
+    pub struct CallHandle<Evt> {
         state: CallState<Evt>,
+        cancel_state: Option<CancelState>,
+    }
+
+    struct CancelState {
+        correlation_id: u64,
+        bridge: Arc<BridgeInner>,
     }
 
     enum CallState<Evt> {
@@ -165,18 +196,48 @@ mod wasm_impl {
         Ready(Option<Box<Result<Evt, BridgeError>>>),
     }
 
-    impl<Evt: DeserializeOwned> CallFuture<Evt> {
+    impl<Evt: DeserializeOwned> CallHandle<Evt> {
         fn pending(
             rx: futures_channel::oneshot::Receiver<Result<RawResponse, BridgeError>>,
+            correlation_id: u64,
+            bridge: Arc<BridgeInner>,
         ) -> Self {
             Self {
                 state: CallState::Pending(send_wrapper::SendWrapper::new(rx)),
+                cancel_state: Some(CancelState {
+                    correlation_id,
+                    bridge,
+                }),
             }
         }
 
         fn ready(result: Result<Evt, BridgeError>) -> Self {
             Self {
                 state: CallState::Ready(Some(Box::new(result))),
+                cancel_state: None,
+            }
+        }
+    }
+
+    impl<Evt> Drop for CallHandle<Evt> {
+        fn drop(&mut self) {
+            if let Some(state) = self.cancel_state.take() {
+                // Send cancel message to worker: [correlation_id, null, null].
+                let _ = crate::transfer::post_to_worker_raw(
+                    &state.bridge.worker,
+                    Some(state.correlation_id),
+                    &wasm_bindgen::JsValue::NULL,
+                    None,
+                );
+                // Reject the pending RPC immediately so no stale response leaks.
+                if let Some(tx) = state
+                    .bridge
+                    .pending
+                    .borrow_mut()
+                    .remove(&state.correlation_id)
+                {
+                    let _ = tx.send(Err(BridgeError::ChannelClosed));
+                }
             }
         }
     }
@@ -184,28 +245,36 @@ mod wasm_impl {
     // SAFETY (logical): CallState is Unpin because:
     // - Pending: SendWrapper<Receiver<...>> is Unpin (Receiver is Unpin).
     // - Ready: Option<Box<...>> is always Unpin (Box is Unpin for any T).
-    impl<Evt> Unpin for CallFuture<Evt> {}
+    impl<Evt> Unpin for CallHandle<Evt> {}
 
-    impl<Evt: DeserializeOwned> std::future::Future for CallFuture<Evt> {
+    impl<Evt: DeserializeOwned> std::future::Future for CallHandle<Evt> {
         type Output = Result<Evt, BridgeError>;
 
         fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
             let this = self.get_mut();
             match &mut this.state {
                 CallState::Ready(result) => match result.take() {
-                    Some(r) => Poll::Ready(*r),
+                    Some(r) => {
+                        // Resolved — don't cancel on drop.
+                        this.cancel_state = None;
+                        Poll::Ready(*r)
+                    }
                     None => Poll::Ready(Err(BridgeError::ChannelClosed)),
                 },
                 CallState::Pending(rx) => match Pin::new(&mut **rx).poll(cx) {
                     Poll::Ready(Ok(Ok(raw))) => {
+                        // Resolved — don't cancel on drop.
+                        this.cancel_state = None;
                         let evt: Evt = serde_wasm_bindgen::from_value(raw.js_value)
-                            .map_err(|e| {
-                                BridgeError::Serialisation(format!("deserialize: {e}"))
-                            })?;
+                            .map_err(|e| BridgeError::Serialisation(format!("deserialize: {e}")))?;
                         Poll::Ready(Ok(evt))
                     }
-                    Poll::Ready(Ok(Err(e))) => Poll::Ready(Err(e)),
+                    Poll::Ready(Ok(Err(e))) => {
+                        this.cancel_state = None;
+                        Poll::Ready(Err(e))
+                    }
                     Poll::Ready(Err(_cancelled)) => {
+                        this.cancel_state = None;
                         Poll::Ready(Err(BridgeError::ChannelClosed))
                     }
                     Poll::Pending => Poll::Pending,

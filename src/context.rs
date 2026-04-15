@@ -1,7 +1,7 @@
-//! Reply context for worker actors.
+//! Response context for worker actors.
 //!
-//! On WASM, replies are posted to the main thread via `postMessage`.
-//! On native (non-WASM), replies are collected in memory for testing.
+//! On WASM, responses are posted to the main thread via `postMessage`.
+//! On native (non-WASM), responses are collected in memory for testing.
 
 // ── Native implementation (for testing) ──────────────────────
 
@@ -12,12 +12,12 @@ mod native_impl {
 
     struct ContextInner<Evt> {
         bytes: Option<Vec<u8>>,
-        replies: RefCell<Vec<(Evt, Option<Vec<u8>>)>>,
+        responses: RefCell<Vec<(Evt, Option<Vec<u8>>)>>,
     }
 
-    /// Reply context for dispatching events back to the main thread.
+    /// Response context for dispatching events back to the main thread.
     ///
-    /// On native targets, replies are collected in memory for testing.
+    /// On native targets, responses are collected in memory for testing.
     /// `Clone + 'static` — safe to move into spawned tasks.
     pub struct Context<Evt> {
         inner: Rc<ContextInner<Evt>>,
@@ -37,7 +37,7 @@ mod native_impl {
             Self {
                 inner: Rc::new(ContextInner {
                     bytes,
-                    replies: RefCell::new(Vec::new()),
+                    responses: RefCell::new(Vec::new()),
                 }),
             }
         }
@@ -48,25 +48,25 @@ mod native_impl {
         }
 
         /// Send an event back to the main thread.
-        pub fn reply(&self, evt: Evt) {
-            self.inner.replies.borrow_mut().push((evt, None));
+        pub fn respond(&self, evt: Evt) {
+            self.inner.responses.borrow_mut().push((evt, None));
         }
 
         /// Send an event with a binary sidecar back to the main thread.
-        pub fn reply_with_bytes(&self, evt: Evt, bytes: Vec<u8>) {
-            self.inner.replies.borrow_mut().push((evt, Some(bytes)));
+        pub fn respond_bytes(&self, evt: Evt, bytes: Vec<u8>) {
+            self.inner.responses.borrow_mut().push((evt, Some(bytes)));
         }
 
-        /// Number of replies sent so far.
-        pub fn reply_count(&self) -> usize {
-            self.inner.replies.borrow().len()
+        /// Number of responses sent so far.
+        pub fn response_count(&self) -> usize {
+            self.inner.responses.borrow().len()
         }
     }
 
     impl<Evt: Clone> Context<Evt> {
-        /// Collect all replies (test helper).
-        pub fn replies(&self) -> Vec<(Evt, Option<Vec<u8>>)> {
-            self.inner.replies.borrow().clone()
+        /// Collect all responses (test helper).
+        pub fn responses(&self) -> Vec<(Evt, Option<Vec<u8>>)> {
+            self.inner.responses.borrow().clone()
         }
     }
 }
@@ -90,7 +90,7 @@ mod wasm_impl {
         replied_correlated: Cell<bool>,
     }
 
-    /// Reply context for dispatching events back to the main thread.
+    /// Response context for dispatching events back to the main thread.
     ///
     /// `Clone + 'static` — safe to move into spawned tasks on the Worker.
     pub struct Context<Evt> {
@@ -137,18 +137,18 @@ mod wasm_impl {
         }
 
         /// Send an event back to the main thread.
-        pub fn reply(&self, evt: Evt) {
+        pub fn respond(&self, evt: Evt) {
             let corr_id = self.take_correlation_id();
             if let Err(e) = crate::transfer::post_to_main(corr_id, &evt, None) {
-                tracing::error!("reply failed: {e}");
+                tracing::error!("respond failed: {e}");
             }
         }
 
         /// Send an event with a binary sidecar back to the main thread.
-        pub fn reply_with_bytes(&self, evt: Evt, bytes: Vec<u8>) {
+        pub fn respond_bytes(&self, evt: Evt, bytes: Vec<u8>) {
             let corr_id = self.take_correlation_id();
             if let Err(e) = crate::transfer::post_to_main(corr_id, &evt, Some(&bytes)) {
-                tracing::error!("reply failed: {e}");
+                tracing::error!("respond failed: {e}");
             }
         }
     }
